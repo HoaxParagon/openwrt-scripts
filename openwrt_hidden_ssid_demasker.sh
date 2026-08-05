@@ -263,48 +263,62 @@ update_ap() {
 # ---------- helper: parse one capture burst ----------
 capture_burst() {
     ch="$1"
-    duration=3
+    duration=5          # longer dwell helps airodump-ng
     tmp="$SCAN_DIR/burst.txt"
 
     set_channel "$ch"
-    # give the radio a moment to settle
-    sleep 1
+    sleep 1             # BusyBox-compatible settle time
 
     if [ "$HAS_AIRODUMP" -eq 1 ]; then
-        # airodump-ng is the most reliable source of BSSID/CH/PWR/ESSID
-        rm -f "$SCAN_DIR/airodump"* 2>/dev/null || true
-        timeout "$duration" airodump-ng \
+        # Clean previous run
+        rm -f "$SCAN_DIR"/airodump* 2>/dev/null || true
+
+        # Run airodump-ng in the background so we can control its lifetime cleanly
+        airodump-ng \
             --output-format csv \
             -w "$SCAN_DIR/airodump" \
             --write-interval 1 \
             -c "$ch" \
-            "$INTERFACE" >/dev/null 2>&1 || true
+            "$INTERFACE" >/dev/null 2>&1 &
+        AIRO_PID=$!
 
-        # parse the CSV that airodump-ng just wrote
-        csv=$(ls "$SCAN_DIR"/airodump*.csv 2>/dev/null | head -n1)
-        if [ -n "$csv" ] && [ -f "$csv" ]; then
-            # Station section starts after a blank line; we only want the AP section
+        sleep "$duration"
+        kill "$AIRO_PID" 2>/dev/null || true
+        wait "$AIRO_PID" 2>/dev/null || true
+        sleep 1          # allow final CSV flush
+
+        # Find the CSV that was just written
+        csv=$(ls -1 "$SCAN_DIR"/airodump*.csv 2>/dev/null | head -n 1)
+
+        if [ -n "$csv" ] && [ -f "$csv" ] && [ -s "$csv" ]; then
+            # Robust parser: stop at the first blank line (end of AP section)
+            # Columns: 1=BSSID, 4=channel, 9=Power, 14=ESSID
             awk -F',' '
-                /^BSSID/ { next }
-                /^$/     { exit }
-                NF >= 14 {
-                    bssid = $1
-                    gsub(/[[:space:]]/, "", bssid)
-                    pwr   = $9
-                    gsub(/[[:space:]]/, "", pwr)
-                    essid = $14
-                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", essid)
+                BEGIN { OFS="|" }
+                /^BSSID/ { next }          # skip header
+                /^[[:space:]]*$/ { exit }  # end of AP list
+                {
+                    # clean fields
+                    bssid = $1;  gsub(/[[:space:]]/, "", bssid)
+                    pwr   = $9;  gsub(/[[:space:]]/, "", pwr)
+                    essid = $14; gsub(/^[[:space:]]+|[[:space:]]+$/, "", essid)
+
                     if (bssid ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) {
                         if (essid == "") essid = "[HIDDEN]"
-                        print bssid "|" ch "|" pwr "|" essid
+                        if (pwr == "")   pwr   = "?"
+                        print bssid, ch, pwr, essid
                     }
                 }
-            ' ch="$ch" "$csv" | while IFS='|' read -r bssid c pwr essid; do
-                update_ap "$bssid" "$c" "$pwr" "$essid"
-            done
+            ' ch="$ch" "$csv" > "$SCAN_DIR/parsed.txt"
+
+            # Feed the cleaned lines into update_ap
+            while IFS='|' read -r bssid c pwr essid; do
+                [ -n "$bssid" ] && update_ap "$bssid" "$c" "$pwr" "$essid"
+            done < "$SCAN_DIR/parsed.txt"
         fi
 
     elif [ "$HAS_TSHARK" -eq 1 ]; then
+        # original tshark path (unchanged)
         timeout "$duration" tshark -i "$INTERFACE" -l -n -Q \
             -T fields -e wlan.bssid -e wlan.ssid -e radiotap.dbm_antsignal \
             -e radiotap.channel.freq -e wlan.fc.type_subtype \
@@ -318,7 +332,7 @@ capture_burst() {
         done < "$tmp"
 
     else
-        # original tcpdump path (kept unchanged)
+        # original tcpdump path (unchanged)
         timeout "$duration" tcpdump -i "$INTERFACE" -l -e -s 256 -n \
             'type mgt' 2>/dev/null > "$tmp" || true
 
