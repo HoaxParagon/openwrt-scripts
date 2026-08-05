@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 #
 # wifi-scan-helper.sh
 # Authorized testing of YOUR OWN network only.
