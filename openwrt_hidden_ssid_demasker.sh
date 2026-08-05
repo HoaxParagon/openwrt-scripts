@@ -14,13 +14,16 @@ set -eu
 # ---------- defaults ----------
 INTERFACE=""
 CHANNELS=""                 # space-separated list; empty = build from band
-BAND="bg"
+BAND="agn"                  # default: a + g + n
 WRITE_PREFIX=""
 HIDDEN_MODE=0
 UPDATE_INTERVAL=1
 HELP=0
 SCAN_DIR=""
 AP_FILE=""                  # temporary file holding "BSSID|CH|PWR|ESSID|TS"
+HAS_2GHZ=0
+HAS_5GHZ=0
+BANDS_DISPLAY=""            # human-readable list of bands actually being scanned
 
 # 2.4 GHz and common 5 GHz channels
 CH_2G="1 2 3 4 5 6 7 8 9 10 11 12 13"
@@ -44,7 +47,7 @@ The given interface must already be in monitor mode
 Options (airodump-ng style):
   -h, --help                  Show this help
   -c, --channel <ch>[,<ch>...]  Fixed channel(s). Overrides band hopping.
-  -b, --band <abg...>         Band hint: a,b,g,n,ac (default: bg)
+  -b, --band <abg...>         Band hint: a,b,g,n,ac,ax,be,all (default: agn)
   -w, --write <prefix>        Write pcap with this prefix (tshark/tcpdump)
   --hidden                    Passive hidden-SSID focus
   -u, --update <secs>         Redisplay interval (default: 1)
@@ -53,6 +56,7 @@ Examples:
   sudo $0 mon0
   sudo $0 -c 1,6,11 --hidden mon0
   sudo $0 -b abg -w /tmp/scan --hidden mon0
+  sudo $0 -b all mon0
 
 After the live scan press Ctrl+C. You will be asked for a comma-separated
 list of result numbers (e.g. 1,3,2) to focus on.
@@ -117,23 +121,74 @@ if ! iw dev "$INTERFACE" info 2>/dev/null | grep -q "type monitor"; then
     exit 1
 fi
 
+# ---------- detect usable frequency bands on this interface ----------
+PHY=$(iw dev "$INTERFACE" info 2>/dev/null | awk '/wiphy/ {print $2}')
+if [ -n "$PHY" ]; then
+    # Look for typical 2.4 GHz and 5 GHz centre frequencies
+    if iw phy "$PHY" info 2>/dev/null | grep -qE '\* 24[0-9]{2} MHz'; then
+        HAS_2GHZ=1
+    fi
+    if iw phy "$PHY" info 2>/dev/null | grep -qE '\* 5[0-9]{3} MHz'; then
+        HAS_5GHZ=1
+    fi
+fi
+
+# Fallback if detection produced nothing (some drivers are sparse)
+if [ "$HAS_2GHZ" -eq 0 ] && [ "$HAS_5GHZ" -eq 0 ]; then
+    HAS_2GHZ=1
+    HAS_5GHZ=1
+fi
+
+echo "[*] Interface : $INTERFACE (already in monitor mode)"
+echo "[*] Detected  : 2.4 GHz support = $HAS_2GHZ    5 GHz support = $HAS_5GHZ"
+
 # ---------- build channel list from band if -c not given ----------
 if [ -z "$CHANNELS" ]; then
     CHANNELS=""
+    WANT_2=0
+    WANT_5=0
+
     case "$BAND" in
-        *a*|*n*|*ac*) CHANNELS="$CHANNELS $CH_5G" ;;
+        *all*)
+            WANT_2=1
+            WANT_5=1
+            ;;
+        *)
+            case "$BAND" in
+                *a*|*n*|*ac*|*ax*|*be*) WANT_5=1 ;;
+            esac
+            case "$BAND" in
+                *b*|*g*|*n*|*ax*|*be*)  WANT_2=1 ;;
+            esac
+            ;;
     esac
-    case "$BAND" in
-        *b*|*g*|*n*)  CHANNELS="$CHANNELS $CH_2G" ;;
-    esac
+
+    # Only add channels the hardware actually supports
+    if [ "$WANT_5" -eq 1 ] && [ "$HAS_5GHZ" -eq 1 ]; then
+        CHANNELS="$CHANNELS $CH_5G"
+    fi
+    if [ "$WANT_2" -eq 1 ] && [ "$HAS_2GHZ" -eq 1 ]; then
+        CHANNELS="$CHANNELS $CH_2G"
+    fi
+
     # unique + numeric sort
     CHANNELS=$(echo $CHANNELS | tr ' ' '\n' | sort -n | uniq | tr '\n' ' ')
 fi
 [ -z "$CHANNELS" ] && CHANNELS="1 6 11"
 
-echo "[*] Interface : $INTERFACE (already in monitor mode)"
+# Build a clean, well-spaced display string of the bands that will actually be scanned
+BANDS_DISPLAY=""
+if echo " $CHANNELS " | grep -qE ' (1|2|3|4|5|6|7|8|9|10|11|12|13) '; then
+    BANDS_DISPLAY="$BANDS_DISPLAY  2.4 GHz"
+fi
+if echo " $CHANNELS " | grep -qE ' (36|40|44|48|52|56|60|64|100|104|108|112|116|120|124|128|132|136|140|144|149|153|157|161|165) '; then
+    BANDS_DISPLAY="$BANDS_DISPLAY  5 GHz"
+fi
+BANDS_DISPLAY=$(echo "$BANDS_DISPLAY" | sed 's/^ *//')
+
 echo "[*] Channels  : $CHANNELS"
 echo "[*] Band hint : $BAND"
+echo "[*] Scanning  : $BANDS_DISPLAY"
 [ "$HIDDEN_MODE" -eq 1 ] && echo "[*] Hidden-SSID passive mode"
 if [ "$HAS_TSHARK" -eq 1 ]; then
     echo "[*] Capture   : tshark"
@@ -247,7 +302,9 @@ while [ "$RUNNING" -eq 1 ]; do
     done
 
     echo
-    echo "Channels hopping: $CHANNELS   |  Hidden mode: $HIDDEN_MODE"
+    # Status line with generous spacing on the right for readability
+    printf "Channels hopping: %s\n" "$CHANNELS"
+    printf "Bands scanned:    %-20s     Hidden mode: %s\n" "$BANDS_DISPLAY" "$HIDDEN_MODE"
     echo "Press Ctrl+C when ready to select targets..."
     sleep "$UPDATE_INTERVAL"
 done
