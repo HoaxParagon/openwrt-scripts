@@ -268,7 +268,7 @@ capture_burst() {
 
     set_channel "$ch"
     # give the radio a moment to settle
-    sleep 0.4
+    sleep 1
 
     if [ "$HAS_AIRODUMP" -eq 1 ]; then
         # airodump-ng is the most reliable source of BSSID/CH/PWR/ESSID
