@@ -2,11 +2,10 @@
 #
 # wifi-scan-helper.sh  (ash / BusyBox compatible)
 # Authorized testing of YOUR OWN network only.
-# No airodump-ng / airmon-ng. Uses iw + (tshark or tcpdump).
+# No airodump-ng / airmon-ng forced. Uses airodump-ng (preferred) or
+# tshark / tcpdump. Monitor mode must already be enabled.
 #
 # WARNING: Only run against networks you own or have explicit permission to test.
-# Requires root and a wireless interface already in monitor mode
-# (monitor mode setup is handled by another script).
 #
 
 set -eu
@@ -84,7 +83,6 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) HELP=1; shift ;;
         -c|--channel)
-            # convert commas to spaces
             CHANNELS=$(echo "$2" | tr ',' ' ')
             shift 2
             ;;
@@ -119,15 +117,17 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # ---------- tool detection ----------
+HAS_AIRODUMP=0
 HAS_TSHARK=0
 HAS_TCPDUMP=0
-command -v tshark  >/dev/null 2>&1 && HAS_TSHARK=1
-command -v tcpdump >/dev/null 2>&1 && HAS_TCPDUMP=1
-command -v iw      >/dev/null 2>&1 || { echo "iw is required"; exit 1; }
-command -v ip      >/dev/null 2>&1 || { echo "ip is required"; exit 1; }
+command -v airodump-ng >/dev/null 2>&1 && HAS_AIRODUMP=1
+command -v tshark      >/dev/null 2>&1 && HAS_TSHARK=1
+command -v tcpdump     >/dev/null 2>&1 && HAS_TCPDUMP=1
+command -v iw          >/dev/null 2>&1 || { echo "iw is required"; exit 1; }
+command -v ip          >/dev/null 2>&1 || { echo "ip is required"; exit 1; }
 
-if [ "$HAS_TSHARK" -eq 0 ] && [ "$HAS_TCPDUMP" -eq 0 ]; then
-    echo "Error: need tshark or tcpdump for monitor-mode capture"
+if [ "$HAS_AIRODUMP" -eq 0 ] && [ "$HAS_TSHARK" -eq 0 ] && [ "$HAS_TCPDUMP" -eq 0 ]; then
+    echo "Error: need airodump-ng, tshark or tcpdump"
     exit 1
 fi
 
@@ -154,7 +154,6 @@ if [ -n "$PHY" ]; then
     fi
 fi
 
-# Fallback if detection produced nothing
 if [ "$HAS_2GHZ" -eq 0 ] && [ "$HAS_5GHZ" -eq 0 ]; then
     HAS_2GHZ=1
     HAS_5GHZ=1
@@ -175,7 +174,6 @@ if [ -z "$CHANNELS" ]; then
             WANT_5=1
             ;;
         *)
-            # Map standards to the frequency ranges they use
             case "$BAND" in
                 *a*|*n*|*ac*|*ax*|*be*) WANT_5=1 ;;
             esac
@@ -185,7 +183,6 @@ if [ -z "$CHANNELS" ]; then
             ;;
     esac
 
-    # Apply explicit frequency restriction
     case "$FREQUENCY" in
         2.4|2.4ghz|2.4GHz|24)
             WANT_5=0
@@ -194,11 +191,9 @@ if [ -z "$CHANNELS" ]; then
             WANT_2=0
             ;;
         auto|*)
-            # leave WANT_2 / WANT_5 as decided by the standards
             ;;
     esac
 
-    # Only include channels the hardware can actually use
     if [ "$WANT_5" -eq 1 ] && [ "$HAS_5GHZ" -eq 1 ]; then
         CHANNELS="$CHANNELS $CH_5G"
     fi
@@ -206,7 +201,6 @@ if [ -z "$CHANNELS" ]; then
         CHANNELS="$CHANNELS $CH_2G"
     fi
 
-    # unique + numeric sort
     CHANNELS=$(echo $CHANNELS | tr ' ' '\n' | sort -n | uniq | tr '\n' ' ')
 fi
 [ -z "$CHANNELS" ] && CHANNELS="1 6 11"
@@ -215,7 +209,6 @@ fi
 if [ "$BAND" = "all" ]; then
     STANDARDS_DISPLAY="a   b   g   n   ac   ax   be"
 else
-    # Insert extra spaces between characters / tokens for readability
     STANDARDS_DISPLAY=$(echo "$BAND" | sed \
         -e 's/ac/ ac /g' \
         -e 's/ax/ ax /g' \
@@ -228,7 +221,10 @@ echo "[*] Channels  : $CHANNELS"
 echo "[*] Standards : $STANDARDS_DISPLAY"
 echo "[*] Frequency : $FREQUENCY"
 [ "$HIDDEN_MODE" -eq 1 ] && echo "[*] Hidden-SSID passive mode"
-if [ "$HAS_TSHARK" -eq 1 ]; then
+
+if [ "$HAS_AIRODUMP" -eq 1 ]; then
+    echo "[*] Capture   : airodump-ng (preferred)"
+elif [ "$HAS_TSHARK" -eq 1 ]; then
     echo "[*] Capture   : tshark"
 else
     echo "[*] Capture   : tcpdump"
@@ -237,7 +233,7 @@ fi
 # ---------- prepare temporary directory ----------
 SCAN_DIR=$(mktemp -d /tmp/wifi-scan.XXXXXX)
 AP_FILE="$SCAN_DIR/aps.txt"
-: > "$AP_FILE"          # empty file
+: > "$AP_FILE"
 
 PCAP_FILE=""
 if [ -n "$WRITE_PREFIX" ]; then
@@ -252,7 +248,6 @@ set_channel() {
 }
 
 # ---------- helper: update AP record ----------
-# Usage: update_ap BSSID CH PWR ESSID
 update_ap() {
     bssid="$1"
     ch="$2"
@@ -260,7 +255,6 @@ update_ap() {
     essid="$4"
     ts=$(date +%s)
 
-    # remove old entry for this BSSID (if any) and append new one
     grep -v "^${bssid}|" "$AP_FILE" > "$AP_FILE.tmp" 2>/dev/null || true
     mv "$AP_FILE.tmp" "$AP_FILE"
     echo "${bssid}|${ch}|${pwr}|${essid}|${ts}" >> "$AP_FILE"
@@ -269,26 +263,62 @@ update_ap() {
 # ---------- helper: parse one capture burst ----------
 capture_burst() {
     ch="$1"
-    duration=2
+    duration=3
     tmp="$SCAN_DIR/burst.txt"
 
     set_channel "$ch"
+    # give the radio a moment to settle
+    sleep 0.4
 
-    if [ "$HAS_TSHARK" -eq 1 ]; then
+    if [ "$HAS_AIRODUMP" -eq 1 ]; then
+        # airodump-ng is the most reliable source of BSSID/CH/PWR/ESSID
+        rm -f "$SCAN_DIR/airodump"* 2>/dev/null || true
+        timeout "$duration" airodump-ng \
+            --output-format csv \
+            -w "$SCAN_DIR/airodump" \
+            --write-interval 1 \
+            -c "$ch" \
+            "$INTERFACE" >/dev/null 2>&1 || true
+
+        # parse the CSV that airodump-ng just wrote
+        csv=$(ls "$SCAN_DIR"/airodump*.csv 2>/dev/null | head -n1)
+        if [ -n "$csv" ] && [ -f "$csv" ]; then
+            # Station section starts after a blank line; we only want the AP section
+            awk -F',' '
+                /^BSSID/ { next }
+                /^$/     { exit }
+                NF >= 14 {
+                    bssid = $1
+                    gsub(/[[:space:]]/, "", bssid)
+                    pwr   = $9
+                    gsub(/[[:space:]]/, "", pwr)
+                    essid = $14
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", essid)
+                    if (bssid ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/) {
+                        if (essid == "") essid = "[HIDDEN]"
+                        print bssid "|" ch "|" pwr "|" essid
+                    }
+                }
+            ' ch="$ch" "$csv" | while IFS='|' read -r bssid c pwr essid; do
+                update_ap "$bssid" "$c" "$pwr" "$essid"
+            done
+        fi
+
+    elif [ "$HAS_TSHARK" -eq 1 ]; then
         timeout "$duration" tshark -i "$INTERFACE" -l -n -Q \
             -T fields -e wlan.bssid -e wlan.ssid -e radiotap.dbm_antsignal \
             -e radiotap.channel.freq -e wlan.fc.type_subtype \
             2>/dev/null > "$tmp" || true
 
-        # tshark tab-separated output
         while IFS="$(printf '\t')" read -r bssid ssid pwr freq subtype; do
             [ -z "$bssid" ] && continue
             [ "$bssid" = "ff:ff:ff:ff:ff:ff" ] && continue
             [ -z "$ssid" ] && ssid="[HIDDEN]"
             update_ap "$bssid" "$ch" "${pwr:--}" "$ssid"
         done < "$tmp"
+
     else
-        # tcpdump fallback – best-effort parsing
+        # original tcpdump path (kept unchanged)
         timeout "$duration" tcpdump -i "$INTERFACE" -l -e -s 256 -n \
             'type mgt' 2>/dev/null > "$tmp" || true
 
@@ -296,11 +326,9 @@ capture_burst() {
             bssid=""
             ssid="[HIDDEN]"
 
-            # extract first MAC-looking string
             bssid=$(echo "$line" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -n1)
             [ -z "$bssid" ] && continue
 
-            # try to find SSID=
             if echo "$line" | grep -q 'SSID='; then
                 ssid=$(echo "$line" | sed -n 's/.*SSID=\([^ ]*\).*/\1/p')
                 [ -z "$ssid" ] && ssid="[HIDDEN]"
@@ -331,7 +359,6 @@ while [ "$RUNNING" -eq 1 ]; do
     echo " #  | BSSID              | CH  | PWR   | ESSID"
     echo "----+--------------------+-----+-------+-------------------------"
 
-    # sort by BSSID and number the lines
     idx=1
     sort -t'|' -k1,1 "$AP_FILE" | while IFS='|' read -r bssid ch pwr essid ts; do
         printf " %2d | %-18s | %3s | %5s | %s\n" \
@@ -340,7 +367,6 @@ while [ "$RUNNING" -eq 1 ]; do
     done
 
     echo
-    # Status line – standards and frequency shown with generous spacing
     printf "Channels hopping: %s\n" "$CHANNELS"
     printf "Standards:        %-28s  Frequency: %s    Hidden mode: %s\n" \
         "$STANDARDS_DISPLAY" "$FREQUENCY" "$HIDDEN_MODE"
@@ -348,7 +374,6 @@ while [ "$RUNNING" -eq 1 ]; do
     sleep "$UPDATE_INTERVAL"
 done
 
-# restore cleanup trap
 trap 'cleanup' EXIT INT TERM
 
 # ---------- second section ----------
@@ -363,7 +388,6 @@ fi
 echo " #  | BSSID              | CH  | PWR   | ESSID"
 echo "----+--------------------+-----+-------+-------------------------"
 
-# build numbered list into a temporary index file
 IDX_FILE="$SCAN_DIR/idx.txt"
 : > "$IDX_FILE"
 idx=1
@@ -379,7 +403,6 @@ printf "Comma-separated numbers (e.g. 1,3,2) or q to quit: "
 read SELECTION
 [ "$SELECTION" = "q" ] || [ -z "$SELECTION" ] && exit 0
 
-# turn commas into spaces
 SELECTION=$(echo "$SELECTION" | tr ',' ' ')
 
 FOCUS_BSSIDS=""
@@ -402,7 +425,7 @@ for n in $SELECTION; do
     fi
 done
 
-FOCUS_BSSIDS=$(echo $FOCUS_BSSIDS)   # trim
+FOCUS_BSSIDS=$(echo $FOCUS_BSSIDS)
 [ -z "$FOCUS_BSSIDS" ] && { echo "Nothing selected"; exit 0; }
 
 # ---------- focused passive monitoring ----------
@@ -416,11 +439,16 @@ echo
 set_channel "$PRIMARY_CH"
 echo "[*] Locked to channel $PRIMARY_CH"
 
-# simple BPF for the first BSSID (extend if needed)
 FIRST_BSSID=$(echo $FOCUS_BSSIDS | awk '{print $1}')
-BPF="type mgt or wlan addr1 $FIRST_BSSID or wlan addr2 $FIRST_BSSID or wlan addr3 $FIRST_BSSID"
 
-if [ "$HAS_TSHARK" -eq 1 ]; then
+if [ "$HAS_AIRODUMP" -eq 1 ]; then
+    # airodump-ng focused mode
+    AIRO_ARGS="--bssid $FIRST_BSSID -c $PRIMARY_CH"
+    [ -n "$PCAP_FILE" ] && AIRO_ARGS="$AIRO_ARGS -w ${WRITE_PREFIX:-/tmp/focused}"
+    # shellcheck disable=SC2086
+    airodump-ng $AIRO_ARGS "$INTERFACE" || true
+
+elif [ "$HAS_TSHARK" -eq 1 ]; then
     TSHARK_ARGS="-i $INTERFACE -l -n"
     [ -n "$PCAP_FILE" ] && TSHARK_ARGS="$TSHARK_ARGS -w $PCAP_FILE"
     # shellcheck disable=SC2086
@@ -428,6 +456,7 @@ if [ "$HAS_TSHARK" -eq 1 ]; then
         -T fields -e frame.time -e wlan.bssid -e wlan.sa -e wlan.ssid \
         -e wlan.fc.type_subtype -e radiotap.dbm_antsignal 2>/dev/null || true
 else
+    BPF="type mgt or wlan addr1 $FIRST_BSSID or wlan addr2 $FIRST_BSSID or wlan addr3 $FIRST_BSSID"
     TCPDUMP_ARGS="-i $INTERFACE -l -e -s 0 -n"
     [ -n "$PCAP_FILE" ] && TCPDUMP_ARGS="$TCPDUMP_ARGS -w $PCAP_FILE"
     # shellcheck disable=SC2086
