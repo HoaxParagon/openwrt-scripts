@@ -5,7 +5,8 @@
 # No airodump-ng / airmon-ng. Uses iw + (tshark or tcpdump).
 #
 # WARNING: Only run against networks you own or have explicit permission to test.
-# Requires root and a wireless adapter that supports monitor mode.
+# Requires root and a wireless interface already in monitor mode
+# (monitor mode setup is handled by another script).
 #
 
 set -eu
@@ -18,8 +19,6 @@ WRITE_PREFIX=""
 HIDDEN_MODE=0
 UPDATE_INTERVAL=1
 HELP=0
-MON_IFACE=""
-ORIGINAL_IFACE=""
 SCAN_DIR=""
 AP_FILE=""                  # temporary file holding "BSSID|CH|PWR|ESSID|TS"
 
@@ -30,13 +29,6 @@ CH_5G="36 40 44 48 52 56 60 64 100 104 108 112 116 120 124 128 132 136 140 144 1
 cleanup() {
     echo
     echo "[*] Cleaning up..."
-    if [ -n "$MON_IFACE" ]; then
-        ip link set "$MON_IFACE" down 2>/dev/null || true
-        iw dev "$MON_IFACE" del 2>/dev/null || true
-    fi
-    if [ -n "$ORIGINAL_IFACE" ]; then
-        ip link set "$ORIGINAL_IFACE" up 2>/dev/null || true
-    fi
     [ -n "$SCAN_DIR" ] && [ -d "$SCAN_DIR" ] && rm -rf "$SCAN_DIR"
     exit 0
 }
@@ -45,6 +37,9 @@ trap 'cleanup' EXIT INT TERM
 usage() {
     cat <<EOF
 Usage: sudo $0 [options] <interface>
+
+The given interface must already be in monitor mode
+(monitor mode is set up by another script).
 
 Options (airodump-ng style):
   -h, --help                  Show this help
@@ -55,9 +50,9 @@ Options (airodump-ng style):
   -u, --update <secs>         Redisplay interval (default: 1)
 
 Examples:
-  sudo $0 wlan0
-  sudo $0 -c 1,6,11 --hidden wlan0
-  sudo $0 -b abg -w /tmp/scan --hidden wlan0
+  sudo $0 mon0
+  sudo $0 -c 1,6,11 --hidden mon0
+  sudo $0 -b abg -w /tmp/scan --hidden mon0
 
 After the live scan press Ctrl+C. You will be asked for a comma-separated
 list of result numbers (e.g. 1,3,2) to focus on.
@@ -110,6 +105,18 @@ if [ "$HAS_TSHARK" -eq 0 ] && [ "$HAS_TCPDUMP" -eq 0 ]; then
     exit 1
 fi
 
+# ---------- verify interface exists and is in monitor mode ----------
+if ! ip link show "$INTERFACE" >/dev/null 2>&1; then
+    echo "Error: interface $INTERFACE does not exist"
+    exit 1
+fi
+
+if ! iw dev "$INTERFACE" info 2>/dev/null | grep -q "type monitor"; then
+    echo "Error: $INTERFACE is not in monitor mode"
+    echo "       (monitor mode must be enabled by another script before running this one)"
+    exit 1
+fi
+
 # ---------- build channel list from band if -c not given ----------
 if [ -z "$CHANNELS" ]; then
     CHANNELS=""
@@ -124,7 +131,7 @@ if [ -z "$CHANNELS" ]; then
 fi
 [ -z "$CHANNELS" ] && CHANNELS="1 6 11"
 
-echo "[*] Interface : $INTERFACE"
+echo "[*] Interface : $INTERFACE (already in monitor mode)"
 echo "[*] Channels  : $CHANNELS"
 echo "[*] Band hint : $BAND"
 [ "$HIDDEN_MODE" -eq 1 ] && echo "[*] Hidden-SSID passive mode"
@@ -134,16 +141,7 @@ else
     echo "[*] Capture   : tcpdump"
 fi
 
-# ---------- create monitor interface ----------
-ORIGINAL_IFACE="$INTERFACE"
-MON_IFACE="mon${INTERFACE}"
-iw dev "$MON_IFACE" del 2>/dev/null || true
-
-echo "[*] Creating monitor interface $MON_IFACE ..."
-iw dev "$INTERFACE" interface add "$MON_IFACE" type monitor
-ip link set "$MON_IFACE" up
-ip link set "$INTERFACE" down 2>/dev/null || true
-
+# ---------- prepare temporary directory ----------
 SCAN_DIR=$(mktemp -d /tmp/wifi-scan.XXXXXX)
 AP_FILE="$SCAN_DIR/aps.txt"
 : > "$AP_FILE"          # empty file
@@ -156,38 +154,5 @@ fi
 # ---------- helper: set channel ----------
 set_channel() {
     ch="$1"
-    iw dev "$MON_IFACE" set channel "$ch" 2>/dev/null || \
-    iw dev "$MON_IFACE" set freq $((ch < 15 ? 2407 + 5*ch : 5000 + 5*ch)) 2>/dev/null || true
-}
-
-# ---------- helper: update AP record ----------
-# Usage: update_ap BSSID CH PWR ESSID
-update_ap() {
-    bssid="$1"
-    ch="$2"
-    pwr="$3"
-    essid="$4"
-    ts=$(date +%s)
-
-    # remove old entry for this BSSID (if any) and append new one
-    grep -v "^${bssid}|" "$AP_FILE" > "$AP_FILE.tmp" 2>/dev/null || true
-    mv "$AP_FILE.tmp" "$AP_FILE"
-    echo "${bssid}|${ch}|${pwr}|${essid}|${ts}" >> "$AP_FILE"
-}
-
-# ---------- helper: parse one capture burst ----------
-capture_burst() {
-    ch="$1"
-    duration=2
-    tmp="$SCAN_DIR/burst.txt"
-
-    set_channel "$ch"
-
-    if [ "$HAS_TSHARK" -eq 1 ]; then
-        timeout "$duration" tshark -i "$MON_IFACE" -l -n -Q \
-            -T fields -e wlan.bssid -e wlan.ssid -e radiotap.dbm_antsignal \
-            -e radiotap.channel.freq -e wlan.fc.type_subtype \
-            2>/dev/null > "$tmp" || true
-
-        # tshark tab-separated output
-        while IFS
+    iw dev "$INTERFACE" set channel "$ch" 2>/dev/null || \
+    iw dev "$INTERFACE" set freq $((ch < 15 ? 2407 + 5*ch : 5000 + 5*ch)) 2>/
