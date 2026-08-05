@@ -17,9 +17,8 @@ unzip ./openwrt-scripts.zip
 
 download without install of unzip:  
 ----------------------------------  
-wget https://raw.githubusercontent.com/HoaxParagon/openwrt-scripts/refs/heads/main/openwrt_hidden_ssid_demasker.sh -O ./openwrt_hidden_demasker.sh  
-wget https://raw.githubusercontent.com/HoaxParagon/openwrt-scripts/refs/heads/main/openwrt_monitor_mode_enabler.sh -O ./openwrt_monitor_mode_enabler.sh  
-
+```wget https://raw.githubusercontent.com/HoaxParagon/openwrt-scripts/refs/heads/main/openwrt_hidden_ssid_demasker.sh -O ./openwrt_hidden_demasker.sh```  
+```wget https://raw.githubusercontent.com/HoaxParagon/openwrt-scripts/refs/heads/main/openwrt_monitor_mode_enabler.sh -O ./openwrt_monitor_mode_enabler.sh```  
 
 
 
