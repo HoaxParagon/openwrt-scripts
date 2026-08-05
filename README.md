@@ -11,14 +11,14 @@ download this file without git:
 -------------------------------  
 (downloads the file to the current directory, names it 'openwrt-scripts.zip', requires install of unzip)  
 apk update && apk install unzip  
-wget https://github.com/HoaxParagon/openwrt-scripts/archive/refs/heads/main.zip -O ./openwrt-scripts.zip  
+curl https://github.com/HoaxParagon/openwrt-scripts/archive/refs/heads/main.zip -o ./openwrt-scripts.zip  
 unzip ./openwrt-scripts.zip  
 
 
 download without install of unzip:  
 ----------------------------------  
-```wget https://raw.githubusercontent.com/HoaxParagon/openwrt-scripts/refs/heads/main/openwrt_hidden_ssid_demasker.sh -O ./openwrt_hidden_demasker.sh```  
-```wget https://raw.githubusercontent.com/HoaxParagon/openwrt-scripts/refs/heads/main/openwrt_monitor_mode_enabler.sh -O ./openwrt_monitor_mode_enabler.sh```  
+```curl https://raw.githubusercontent.com/HoaxParagon/openwrt-scripts/refs/heads/main/openwrt_hidden_ssid_demasker.sh -o ./openwrt_hidden_demasker.sh```  
+```curl https://raw.githubusercontent.com/HoaxParagon/openwrt-scripts/refs/heads/main/openwrt_monitor_mode_enabler.sh -o ./openwrt_monitor_mode_enabler.sh```  
 
 make them executable  
 --------------------  
