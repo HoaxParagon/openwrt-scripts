@@ -13,8 +13,9 @@ set -eu
 
 # ---------- defaults ----------
 INTERFACE=""
-CHANNELS=""                 # space-separated list; empty = build from band
-BAND="agn"                  # default: a + g + n
+CHANNELS=""                 # space-separated list; empty = build from standards + frequency
+BAND="agn"                  # default 802.11 standards: a + g + n
+FREQUENCY="auto"            # auto | 2.4 | 5
 WRITE_PREFIX=""
 HIDDEN_MODE=0
 UPDATE_INTERVAL=1
@@ -23,7 +24,7 @@ SCAN_DIR=""
 AP_FILE=""                  # temporary file holding "BSSID|CH|PWR|ESSID|TS"
 HAS_2GHZ=0
 HAS_5GHZ=0
-BANDS_DISPLAY=""            # human-readable list of bands actually being scanned
+STANDARDS_DISPLAY=""        # human-readable list of 802.11 standards being used
 
 # 2.4 GHz and common 5 GHz channels
 CH_2G="1 2 3 4 5 6 7 8 9 10 11 12 13"
@@ -44,10 +45,15 @@ Usage: sudo $0 [options] <interface>
 The given interface must already be in monitor mode
 (monitor mode is set up by another script).
 
-Options (airodump-ng style):
+Options:
   -h, --help                  Show this help
-  -c, --channel <ch>[,<ch>...]  Fixed channel(s). Overrides band hopping.
-  -b, --band <abg...>         Band hint: a,b,g,n,ac,ax,be,all (default: agn)
+  -c, --channel <ch>[,<ch>...]  Fixed channel(s). Overrides standard/frequency hopping.
+  -s, --standard, --std <list>  802.11 standards to include:
+                              a, b, g, n, ac, ax, be, or all
+                              (default: agn)
+  -f, --freq, --frequency <val> Frequency selection:
+                              2.4 | 5 | auto
+                              (default: auto)
   -w, --write <prefix>        Write pcap with this prefix (tshark/tcpdump)
   --hidden                    Passive hidden-SSID focus
   -u, --update <secs>         Redisplay interval (default: 1)
@@ -55,8 +61,17 @@ Options (airodump-ng style):
 Examples:
   sudo $0 mon0
   sudo $0 -c 1,6,11 --hidden mon0
-  sudo $0 -b abg -w /tmp/scan --hidden mon0
-  sudo $0 -b all mon0
+  sudo $0 -s abg -f 2.4 -w /tmp/scan --hidden mon0
+  sudo $0 -s all -f auto mon0
+
+Notes on standards → channels:
+  b, g           → 2.4 GHz channels
+  a, ac          → 5 GHz channels
+  n, ax, be      → both 2.4 GHz and 5 GHz channels
+  all            → every standard the hardware supports
+
+The frequency option further restricts the channel list.
+When set to "auto" the script uses only the ranges the hardware reports as capable.
 
 After the live scan press Ctrl+C. You will be asked for a comma-separated
 list of result numbers (e.g. 1,3,2) to focus on.
@@ -73,7 +88,14 @@ while [ $# -gt 0 ]; do
             CHANNELS=$(echo "$2" | tr ',' ' ')
             shift 2
             ;;
-        -b|--band) BAND="$2"; shift 2 ;;
+        -s|--standard|--std)
+            BAND="$2"
+            shift 2
+            ;;
+        -f|--freq|--frequency)
+            FREQUENCY="$2"
+            shift 2
+            ;;
         -w|--write) WRITE_PREFIX="$2"; shift 2 ;;
         -u|--update) UPDATE_INTERVAL="$2"; shift 2 ;;
         --hidden) HIDDEN_MODE=1; shift ;;
@@ -121,10 +143,9 @@ if ! iw dev "$INTERFACE" info 2>/dev/null | grep -q "type monitor"; then
     exit 1
 fi
 
-# ---------- detect usable frequency bands on this interface ----------
+# ---------- detect usable frequency ranges ----------
 PHY=$(iw dev "$INTERFACE" info 2>/dev/null | awk '/wiphy/ {print $2}')
 if [ -n "$PHY" ]; then
-    # Look for typical 2.4 GHz and 5 GHz centre frequencies
     if iw phy "$PHY" info 2>/dev/null | grep -qE '\* 24[0-9]{2} MHz'; then
         HAS_2GHZ=1
     fi
@@ -133,16 +154,16 @@ if [ -n "$PHY" ]; then
     fi
 fi
 
-# Fallback if detection produced nothing (some drivers are sparse)
+# Fallback if detection produced nothing
 if [ "$HAS_2GHZ" -eq 0 ] && [ "$HAS_5GHZ" -eq 0 ]; then
     HAS_2GHZ=1
     HAS_5GHZ=1
 fi
 
 echo "[*] Interface : $INTERFACE (already in monitor mode)"
-echo "[*] Detected  : 2.4 GHz support = $HAS_2GHZ    5 GHz support = $HAS_5GHZ"
+echo "[*] Hardware  : 2.4 GHz capable = $HAS_2GHZ    5 GHz capable = $HAS_5GHZ"
 
-# ---------- build channel list from band if -c not given ----------
+# ---------- build channel list from requested 802.11 standards + frequency ----------
 if [ -z "$CHANNELS" ]; then
     CHANNELS=""
     WANT_2=0
@@ -154,6 +175,7 @@ if [ -z "$CHANNELS" ]; then
             WANT_5=1
             ;;
         *)
+            # Map standards to the frequency ranges they use
             case "$BAND" in
                 *a*|*n*|*ac*|*ax*|*be*) WANT_5=1 ;;
             esac
@@ -163,7 +185,20 @@ if [ -z "$CHANNELS" ]; then
             ;;
     esac
 
-    # Only add channels the hardware actually supports
+    # Apply explicit frequency restriction
+    case "$FREQUENCY" in
+        2.4|2.4ghz|2.4GHz|24)
+            WANT_5=0
+            ;;
+        5|5ghz|5GHz)
+            WANT_2=0
+            ;;
+        auto|*)
+            # leave WANT_2 / WANT_5 as decided by the standards
+            ;;
+    esac
+
+    # Only include channels the hardware can actually use
     if [ "$WANT_5" -eq 1 ] && [ "$HAS_5GHZ" -eq 1 ]; then
         CHANNELS="$CHANNELS $CH_5G"
     fi
@@ -176,19 +211,22 @@ if [ -z "$CHANNELS" ]; then
 fi
 [ -z "$CHANNELS" ] && CHANNELS="1 6 11"
 
-# Build a clean, well-spaced display string of the bands that will actually be scanned
-BANDS_DISPLAY=""
-if echo " $CHANNELS " | grep -qE ' (1|2|3|4|5|6|7|8|9|10|11|12|13) '; then
-    BANDS_DISPLAY="$BANDS_DISPLAY  2.4 GHz"
+# Build a clean, well-spaced display of the 802.11 standards in use
+if [ "$BAND" = "all" ]; then
+    STANDARDS_DISPLAY="a   b   g   n   ac   ax   be"
+else
+    # Insert extra spaces between characters / tokens for readability
+    STANDARDS_DISPLAY=$(echo "$BAND" | sed \
+        -e 's/ac/ ac /g' \
+        -e 's/ax/ ax /g' \
+        -e 's/be/ be /g' \
+        -e 's/\([abgn]\)/\1 /g' \
+        | tr -s ' ' | sed 's/^ *//;s/ *$//')
 fi
-if echo " $CHANNELS " | grep -qE ' (36|40|44|48|52|56|60|64|100|104|108|112|116|120|124|128|132|136|140|144|149|153|157|161|165) '; then
-    BANDS_DISPLAY="$BANDS_DISPLAY  5 GHz"
-fi
-BANDS_DISPLAY=$(echo "$BANDS_DISPLAY" | sed 's/^ *//')
 
 echo "[*] Channels  : $CHANNELS"
-echo "[*] Band hint : $BAND"
-echo "[*] Scanning  : $BANDS_DISPLAY"
+echo "[*] Standards : $STANDARDS_DISPLAY"
+echo "[*] Frequency : $FREQUENCY"
 [ "$HIDDEN_MODE" -eq 1 ] && echo "[*] Hidden-SSID passive mode"
 if [ "$HAS_TSHARK" -eq 1 ]; then
     echo "[*] Capture   : tshark"
@@ -302,9 +340,10 @@ while [ "$RUNNING" -eq 1 ]; do
     done
 
     echo
-    # Status line with generous spacing on the right for readability
+    # Status line – standards and frequency shown with generous spacing
     printf "Channels hopping: %s\n" "$CHANNELS"
-    printf "Bands scanned:    %-20s     Hidden mode: %s\n" "$BANDS_DISPLAY" "$HIDDEN_MODE"
+    printf "Standards:        %-28s  Frequency: %s    Hidden mode: %s\n" \
+        "$STANDARDS_DISPLAY" "$FREQUENCY" "$HIDDEN_MODE"
     echo "Press Ctrl+C when ready to select targets..."
     sleep "$UPDATE_INTERVAL"
 done
